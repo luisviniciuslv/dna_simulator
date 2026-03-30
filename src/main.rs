@@ -1,171 +1,204 @@
 use macroquad::{prelude::*, rand::gen_range};
 
-// Configurações globais
-const FOOD_COUNT: usize = 60;
-const INITIAL_AGENTS: usize = 20;
-const MUTATION_RATE: f32 = 0.1; // 10% de chance de mudança drástica ou variação pequena
-const ENERGY_TO_REPRODUCE: f32 = 200.0;
+// --- CONFIGURAÇÕES ---
+const GRID_SIZE: f32 = 50.0;
+const INITIAL_AGENTS: usize = 30;
+const FOOD_COUNT: usize = 50;
+const ENERGY_LOSS_WALK: f32 = 0.02;
+const ENERGY_LOSS_RUN: f32 = 0.1;
+const ATTACK_COST: f32 = 0.5;
 
-#[derive(Clone, Copy)]
-struct DNA {
-    speed: f32,
-    vision: f32,
-    color: Color,
+// --- ESTRUTURAS DE IA ---
+
+#[derive(Clone)]
+struct Brain {
+    // Pesos da Rede Neural (Entradas -> Saídas)
+    // 6 entradas: [Dist_Comida, Ang_Comida, Dist_Inimigo, Ang_Inimigo, Energia, Constante]
+    // 3 saídas: [Giro, Velocidade, Intenção_Ataque]
+    weights: Vec<f32>, 
 }
+
+impl Brain {
+    fn new_random() -> Self {
+        let weights = (0..18).map(|_| gen_range(-1.0, 1.0)).collect();
+        Self { weights }
+    }
+
+    fn mutate(&self) -> Self {
+        let mut new_weights = self.weights.clone();
+        for w in new_weights.iter_mut() {
+            if gen_range(0.0, 1.0) < 0.1 { // 10% de chance de mutação por peso
+                *w += gen_range(-0.2, 0.2);
+            }
+        }
+        Self { weights: new_weights }
+    }
+
+    // Processa entradas e retorna (giro, velocidade, ataque)
+    fn think(&self, inputs: &[f32; 6]) -> (f32, f32, f32) {
+        let mut outputs = [0.0; 3];
+        for i in 0..3 {
+            let mut sum = 0.0;
+            for j in 0..6 {
+                sum += inputs[j] * self.weights[i * 6 + j];
+            }
+            outputs[i] = sum.tanh(); // Ativação para manter entre -1 e 1
+        }
+        (outputs[0], outputs[1], outputs[2])
+    }
+}
+
+// --- ENTIDADES ---
 
 struct Agent {
     pos: Vec2,
-    vel: Vec2,
+    angle: f32,
     energy: f32,
-    dna: DNA,
-}
-
-struct Food {
-    pos: Vec2,
+    brain: Brain,
+    color: Color,
+    is_attacking: bool,
 }
 
 impl Agent {
-    fn new(pos: Vec2, dna: DNA) -> Self {
+    fn new(pos: Vec2, brain: Brain, color: Color) -> Self {
         Self {
             pos,
-            vel: vec2(gen_range(-1.0, 1.0), gen_range(-1.0, 1.0)).normalize(),
+            angle: gen_range(0.0, std::f32::consts::TAU),
             energy: 100.0,
-            dna,
+            brain,
+            color,
+            is_attacking: false,
         }
     }
 
-    // Cria um filho com DNA levemente mutado
-    fn reproduce(&mut self) -> Agent {
-        self.energy /= 2.0; // Divide a energia com o filho
-        let mut child_dna = self.dna;
+    fn update(&mut self, closest_food: Option<Vec2>, closest_enemy: Option<Vec2>) {
+        // Preparar entradas para o cérebro
+        let food_rel = closest_food.map(|f| (f - self.pos)).unwrap_or(Vec2::ZERO);
+        let enemy_rel = closest_enemy.map(|e| (e - self.pos)).unwrap_or(Vec2::ZERO);
 
-        // Mutação na velocidade
-        child_dna.speed += gen_range(-0.2, 0.2);
-        child_dna.speed = child_dna.speed.max(0.5);
+        let inputs = [
+            food_rel.length() / screen_width(),
+            food_rel.y.atan2(food_rel.x) - self.angle,
+            enemy_rel.length() / screen_width(),
+            enemy_rel.y.atan2(enemy_rel.x) - self.angle,
+            self.energy / 200.0,
+            1.0 // Bias
+        ];
 
-        // Mutação na visão
-        child_dna.vision += gen_range(-10.0, 10.0);
-        child_dna.vision = child_dna.vision.max(10.0);
+        let (steer, speed_input, attack_input) = self.brain.think(&inputs);
 
-        // Mutação leve na cor para rastrear linhagens
-        child_dna.color.r = (child_dna.color.r + gen_range(-0.05, 0.05)).clamp(0.0, 1.0);
-        child_dna.color.g = (child_dna.color.g + gen_range(-0.05, 0.05)).clamp(0.0, 1.0);
-        child_dna.color.b = (child_dna.color.b + gen_range(-0.05, 0.05)).clamp(0.0, 1.0);
+        // Aplicar resultados
+        self.angle += steer * 0.1;
+        
+        // Velocidade: -1 a 1 mapeado para 0.5 (devagar) a 4.0 (correndo)
+        let speed = ((speed_input + 1.0) / 2.0) * 3.5 + 0.5;
+        let velocity = vec2(self.angle.cos(), self.angle.sin()) * speed;
+        self.pos += velocity;
 
-        Agent::new(self.pos, child_dna)
-    }
-
-    fn update(&mut self, foods: &[Food]) {
-        // Encontrar comida mais próxima dentro da visão
-        let mut closest_dist = self.dna.vision;
-        let mut target = None;
-
-        for food in foods {
-            let dist = self.pos.distance(food.pos);
-            if dist < closest_dist {
-                closest_dist = dist;
-                target = Some(food.pos);
-            }
+        // Custos de energia
+        self.energy -= if speed > 2.0 { ENERGY_LOSS_RUN } else { ENERGY_LOSS_WALK };
+        
+        self.is_attacking = attack_input > 0.5;
+        if self.is_attacking {
+            self.energy -= ATTACK_COST;
         }
 
-        // Se viu comida, move-se para lá. Se não, move-se conforme a velocidade atual.
-        if let Some(target_pos) = target {
-            let desired = (target_pos - self.pos).normalize() * self.dna.speed;
-            // Steering: suave ajuste de direção
-            let steer = (desired - self.vel) * 0.1;
-            self.vel += steer;
-        }
-
-        // Limita a velocidade ao DNA
-        self.vel = self.vel.normalize() * self.dna.speed;
-        self.pos += self.vel;
-
-        // Custo metabólico: velocidade e visão custam energia
-        let metabolism = (self.dna.speed.powi(2) * 0.01) + (self.dna.vision * 0.0005) + 0.01;
-        self.energy -= metabolism;
-
-        // Borda do mundo
-        if self.pos.x < 0.0 { self.pos.x = screen_width(); }
-        if self.pos.x > screen_width() { self.pos.x = 0.0; }
-        if self.pos.y < 0.0 { self.pos.y = screen_height(); }
-        if self.pos.y > screen_height() { self.pos.y = 0.0; }
+        // Limites do mapa (Não atravessa)
+        self.pos.x = self.pos.x.clamp(5.0, screen_width() - 5.0);
+        self.pos.y = self.pos.y.clamp(5.0, screen_height() - 5.0);
     }
 
     fn draw(&self) {
-        // Desenha raio de visão (opcional para debug)
-        // draw_circle_lines(self.pos.x, self.pos.y, self.dna.vision, 1.0, Color::new(1.0, 1.0, 1.0, 0.1));
+        let draw_color = if self.is_attacking { RED } else { self.color };
+        draw_poly(self.pos.x, self.pos.y, 3, 6.0, self.angle.to_degrees(), draw_color);
         
-        draw_circle(self.pos.x, self.pos.y, 4.0, self.dna.color);
+        // Barra de energia pequena acima
+        draw_rectangle(self.pos.x - 5.0, self.pos.y - 10.0, (self.energy / 10.0).max(0.0), 2.0, GREEN);
     }
 }
 
-#[macroquad::main("Ecossistema Evolutivo")]
+// --- MAIN LOOP ---
+
+#[macroquad::main("Evolução Milenar: Milestone 4")]
 async fn main() {
     let mut agents: Vec<Agent> = (0..INITIAL_AGENTS)
-        .map(|_| {
-            Agent::new(
-                vec2(gen_range(0.0, screen_width()), gen_range(0.0, screen_height())),
-                DNA {
-                    speed: gen_range(1.5, 3.0),
-                    vision: gen_range(50.0, 150.0),
-                    color: Color::new(gen_range(0.3, 1.0), gen_range(0.3, 1.0), gen_range(0.3, 1.0), 1.0),
-                },
-            )
-        })
+        .map(|_| Agent::new(
+            vec2(gen_range(0.0, screen_width()), gen_range(0.0, screen_height())),
+            Brain::new_random(),
+            Color::new(gen_range(0.4, 1.0), gen_range(0.4, 1.0), 1.0, 1.0)
+        ))
         .collect();
 
-    let mut foods: Vec<Food> = (0..FOOD_COUNT)
-        .map(|_| Food { pos: vec2(gen_range(0.0, screen_width()), gen_range(0.0, screen_height())) })
+    let mut foods: Vec<Vec2> = (0..FOOD_COUNT)
+        .map(|_| vec2(gen_range(0.0, screen_width()), gen_range(0.0, screen_height())))
         .collect();
 
     loop {
         clear_background(BLACK);
 
         // Repovoar comida
-        if foods.len() < FOOD_COUNT {
-            if rand::gen_range(0, 10) == 0 {
-                foods.push(Food { pos: vec2(gen_range(0.0, screen_width()), gen_range(0.0, screen_height())) });
-            }
+        if foods.len() < FOOD_COUNT && gen_range(0, 5) == 0 {
+            foods.push(vec2(gen_range(10.0, screen_width()-10.0), gen_range(10.0, screen_height()-10.0)));
         }
 
-        // Lógica de colisão com comida (Alimentação)
-        for agent in agents.iter_mut() {
-            let mut i = 0;
-            while i < foods.len() {
-                if agent.pos.distance(foods[i].pos) < 8.0 {
-                    agent.energy += 30.0;
-                    foods.remove(i);
-                } else {
-                    i += 1;
+        // --- Lógica de Interação ---
+        // (Simulando o Grid: Para este exemplo simplificado, usamos busca direta, 
+        // mas as entradas da IA já limitam o comportamento)
+        
+        let mut new_agents = Vec::new();
+
+        // 1. Alimentação e Combate
+        for i in 0..agents.len() {
+            // Comer comida
+            foods.retain(|&f| {
+                if agents[i].pos.distance(f) < 10.0 {
+                    agents[i].energy += 40.0;
+                    false
+                } else { true }
+            });
+
+            // Ataque entre agentes
+            if agents[i].is_attacking {
+                for j in 0..agents.len() {
+                    if i == j { continue; }
+                    let dist = agents[i].pos.distance(agents[j].pos);
+                    if dist < 15.0 {
+                        agents[j].energy -= 2.0; // Dano ao alvo
+                        agents[i].energy += 1.0; // Atacante ganha parte (predação)
+                    }
                 }
             }
         }
 
-        // Atualizar Agentes
+        // 2. Pensar e Mover
         for agent in agents.iter_mut() {
-            agent.update(&foods);
-            agent.draw();
-        }
+            let closest_f = foods.iter().min_by(|a, b| 
+                agent.pos.distance(**a).partial_cmp(&agent.pos.distance(**b)).unwrap_or(std::cmp::Ordering::Equal)
+            ).cloned();
 
-        // Reprodução
-        let mut offspring = Vec::new();
-        for agent in agents.iter_mut() {
-            if agent.energy > ENERGY_TO_REPRODUCE {
-                offspring.push(agent.reproduce());
+            // Simular "inimigo" próximo para o cérebro
+            let closest_e = None; // Pode ser implementado similar à comida
+
+            agent.update(closest_f, closest_e);
+            agent.draw();
+
+            // Reprodução
+            if agent.energy > 200.0 {
+                agent.energy -= 100.0;
+                new_agents.push(Agent::new(agent.pos, agent.brain.mutate(), agent.color));
             }
         }
-        agents.extend(offspring);
 
-        // Morte
+        // 3. Limpeza
         agents.retain(|a| a.energy > 0.0);
+        agents.extend(new_agents);
 
-        // Renderizar Comida
+        // Desenhar Comida
         for food in &foods {
-            draw_circle(food.pos.x, food.pos.y, 2.0, GREEN);
+            draw_circle(food.x, food.y, 2.5, GREEN);
         }
 
-        // UI
-        draw_text(&format!("População: {}", agents.len()), 10.0, 20.0, 20.0, WHITE);
+        draw_text(&format!("População: {} | Comida: {}", agents.len(), foods.len()), 10.0, 20.0, 20.0, WHITE);
         
         next_frame().await
     }
