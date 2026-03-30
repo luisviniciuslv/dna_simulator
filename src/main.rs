@@ -1,29 +1,29 @@
 use macroquad::{prelude::*, rand::gen_range};
 
 // --- CONFIGURAÇÕES DO ECOSSISTEMA ---
-const INITIAL_AGENTS: usize = 12;
-const INITIAL_FOOD_COUNT: usize = 10;
-const VISION_RADIUS: f32 = 160.0; 
+const INITIAL_AGENTS: usize = 2;
+const INITIAL_FOOD_COUNT: usize = 1;
+const VISION_RADIUS: f32 = 220.0; 
 const WALL_SENSE_DIST: f32 = 45.0; 
 
 // Mecânicas de Sobrevivência e Combate
-const FAMILY_PROTECTION_TIME: f32 = 10.0; // 10 segundos sem fogo amigo familiar
-const SPAWN_PROTECTION_TIME: f32 = 5.0;  // Proteção geral inicial
-const ATTACK_COOLDOWN_TIME: f32 = 0.8;    // Recarga do bote
-const KNOCKBACK_FORCE: f32 = 12.0;       // Força de recuo suavizada (evita teleporte)
+const FAMILY_PROTECTION_TIME: f32 = 10.0; 
+const SPAWN_PROTECTION_TIME: f32 = 5.0;  
+const ATTACK_COOLDOWN_TIME: f32 = 1.5;    
+const HIT_STUN_TIME: f32 = 0.6;          
+const KNOCKBACK_IMPULSE: f32 = 16.0;     
 
-// Custos de energia
-const ENERGY_LOSS_IDLE: f32 = 0.004;
-const ENERGY_LOSS_MOVE: f32 = 0.015;
-const ENERGY_LOSS_RUN: f32 = 0.08;
-const ATTACK_COST: f32 = 0.6; 
+// --- METABOLISMO (Punir o giro inútil) ---
+const ENERGY_LOSS_IDLE: f32 = 0.015;     
+const ENERGY_LOSS_MOVE: f32 = 0.05;      
+const ENERGY_LOSS_RUN: f32 = 0.30;       
+const ENERGY_LOSS_ROTATION: f32 = 0.04;  // Aumentado para forçar eficiência
+const ATTACK_COST: f32 = 1.2;            
 
 // --- ESTRUTURAS DE IA ---
 
 #[derive(Clone)]
 struct Brain {
-    // 10 entradas: [Vê_Comida, Ang_Comida, Vê_Inimigo, Ang_Inimigo, Energia, Parede_Esq, Parede_Dir, Parede_Topo, Parede_Fundo, Bias]
-    // 3 saídas: [Giro, Velocidade, Ataque]
     weights: Vec<f32>,
 }
 
@@ -31,25 +31,18 @@ impl Brain {
     fn new_random() -> Self {
         let mut weights = vec![0.0; 30]; 
         
-        // Saída 0: Giro
-        weights[1] = 1.4;   // Virar para comida
-        weights[3] = 0.8;   // Virar para inimigo
-        weights[5] = 1.0;   // Fugir da parede esquerda
-        weights[6] = -1.0;  // Fugir da parede direita
-        
-        // Saída 1: Velocidade
-        weights[19] = 0.4;  // Impulso base (Bias)
-        weights[10] = 1.0;  // Acelerar se ver comida
-        weights[14] = -0.5; // Desacelerar se energia estiver baixa (Input 4)
-        
-        // Saída 2: Ataque
-        weights[22] = 2.0;  // Atacar se inimigo estiver perto
-        weights[24] = 1.2;  // Atacar mais se tiver muita energia (Input 4)
-        weights[29] = -0.8; // Inibição natural de ataque (Bias)
+        weights[1] = 2.5;   // Virar para comida
+        weights[3] = 1.5;   // Virar para inimigo
+        weights[5] = 1.2;   
+        weights[6] = -1.2;  
+        weights[19] = 0.6;  
+        weights[10] = 1.8;  
+        weights[22] = 3.0;  // Atacar agressivamente (Entrada 2 - Inimigo Perto)
+        weights[29] = -0.8; 
 
         for w in weights.iter_mut() {
             if *w == 0.0 {
-                *w = gen_range(-0.5, 0.5);
+                *w = gen_range(-0.6, 0.6);
             } else {
                 *w += gen_range(-0.2, 0.2);
             }
@@ -60,8 +53,8 @@ impl Brain {
     fn mutate(&self) -> Self {
         let mut new_weights = self.weights.clone();
         for w in new_weights.iter_mut() {
-            if gen_range(0.0, 1.0) < 0.18 {
-                *w += gen_range(-0.12, 0.12);
+            if gen_range(0.0, 1.0) < 0.15 {
+                *w += gen_range(-0.1, 0.1);
             }
         }
         Self { weights: new_weights }
@@ -99,10 +92,14 @@ struct Agent {
     color: Color,
     is_attacking: bool,
     current_speed: f32,
+    impulse_vec: Vec2,      
     generation: u32,
     wander_t: f32, 
-    family_timer: f32,     // Proteção entre pais e filhos
-    attack_cooldown: f32,  // Recarga do bote
+    family_timer: f32,     
+    spawn_timer: f32,      
+    attack_cooldown: f32,  
+    hit_timer: f32,
+    target_offset: f32, // Offset aleatório para quebrar o giro infinito
 }
 
 impl Agent {
@@ -117,39 +114,50 @@ impl Agent {
             color,
             is_attacking: false,
             current_speed: 0.0,
+            impulse_vec: Vec2::ZERO,
             generation,
             wander_t: gen_range(0.0, 100.0),
             family_timer: FAMILY_PROTECTION_TIME,
+            spawn_timer: SPAWN_PROTECTION_TIME,
             attack_cooldown: 0.0,
+            hit_timer: 0.0,
+            target_offset: gen_range(-0.1, 0.1), // Diferente para cada indivíduo
         }
     }
 
     fn update(&mut self, closest_food: Option<Vec2>, closest_enemy: Option<Vec2>, world_w: f32, world_h: f32, dt: f32) {
-        // Atualizar timers
         if self.family_timer > 0.0 { self.family_timer -= dt; }
+        if self.spawn_timer > 0.0 { self.spawn_timer -= dt; }
         if self.attack_cooldown > 0.0 { self.attack_cooldown -= dt; }
+        if self.hit_timer > 0.0 { self.hit_timer -= dt; }
 
         let mut inputs = [0.0; 10];
+        let mut target_dist = f32::MAX;
+        let mut target_angle_err = 0.0;
         
-        // [0, 1] Percepção de Comida
         if let Some(f) = closest_food {
             let dist = self.pos.distance(f);
             if dist < VISION_RADIUS {
                 inputs[0] = 1.0 - (dist / VISION_RADIUS); 
                 let rel = f - self.pos;
-                let target_angle = rel.y.atan2(rel.x);
-                inputs[1] = wrap_angle(target_angle - self.angle) / std::f32::consts::PI;
+                let t_angle = rel.y.atan2(rel.x) + self.target_offset; // Quebra de simetria
+                inputs[1] = wrap_angle(t_angle - self.angle) / std::f32::consts::PI;
+                target_dist = dist;
+                target_angle_err = inputs[1].abs();
             }
         }
 
-        // [2, 3] Percepção de Inimigo
         if let Some(e) = closest_enemy {
             let dist = self.pos.distance(e);
             if dist < VISION_RADIUS {
                 inputs[2] = 1.0 - (dist / VISION_RADIUS);
                 let rel = e - self.pos;
-                let target_angle = rel.y.atan2(rel.x);
-                inputs[3] = wrap_angle(target_angle - self.angle) / std::f32::consts::PI;
+                let t_angle = rel.y.atan2(rel.x) + self.target_offset; // Quebra de simetria
+                inputs[3] = wrap_angle(t_angle - self.angle) / std::f32::consts::PI;
+                if dist < target_dist {
+                    target_dist = dist;
+                    target_angle_err = inputs[3].abs();
+                }
             }
         }
 
@@ -162,43 +170,55 @@ impl Agent {
 
         let (steer, speed_input, attack_input) = self.brain.think(&inputs);
 
-        let is_searching = inputs[0] == 0.0 && inputs[2] == 0.0;
+        let has_target = inputs[0] > 0.0 || inputs[2] > 0.0;
         let is_near_wall = inputs[5] > 0.0 || inputs[6] > 0.0 || inputs[7] > 0.0 || inputs[8] > 0.0;
 
-        if is_searching && !is_near_wall {
+        if !has_target && !is_near_wall {
             self.wander_t += 0.05;
             self.angle += (self.wander_t.sin() * 0.04) + gen_range(-0.01, 0.01);
-            self.current_speed = self.current_speed * 0.96 + 0.35 * 0.04; 
+            self.current_speed = self.current_speed * 0.94 + 0.6 * 0.06; 
         } else {
-            self.angle += steer * 0.12; 
-            let mut target_speed = if speed_input > -0.3 { ((speed_input + 0.3) / 1.3) * 1.3 } else { 0.0 };
+            // FLUIDEZ SEM ÓRBITA: Redução de velocidade baseada no erro, mas nunca para.
+            let alignment_factor = (1.0 - target_angle_err).powi(2).clamp(0.4, 1.0);
+            let mut target_multiplier = 0.6 + (alignment_factor * 1.4); 
             
-            // "O Bote" suavizado - multiplicador menor para evitar teleporte visual
-            if attack_input > 0.4 && self.attack_cooldown <= 0.0 {
-                target_speed *= 1.6;
+            if has_target && target_dist < 30.0 { target_multiplier *= 0.7; }
+
+            // Se estiver em cooldown de ataque ou foi atingido, o giro é mais lento (recuperação)
+            let turn_speed = if self.hit_timer > 0.0 { 0.1 } else { 0.3 };
+            self.angle += steer * turn_speed; 
+            
+            let mut target_speed = if speed_input > -0.3 { ((speed_input + 0.3) / 1.3) * 1.5 } else { 0.0 };
+            target_speed *= target_multiplier;
+
+            // Bote Decisivo: Se estiver minimamente alinhado e decidir atacar, ele VAI.
+            if attack_input > 0.4 && self.attack_cooldown <= 0.0 && target_angle_err < 0.2 {
+                let dash_dir = vec2(self.angle.cos(), self.angle.sin());
+                self.impulse_vec += dash_dir * 7.0; // Bote mais forte para atravessar o alvo
+                self.attack_cooldown = ATTACK_COOLDOWN_TIME;
+                self.energy -= ATTACK_COST;
             }
 
-            // Interpolação de velocidade (Inércia)
             self.current_speed = self.current_speed * 0.85 + target_speed * 0.15;
         }
 
-        let velocity = vec2(self.angle.cos(), self.angle.sin()) * self.current_speed;
-        self.pos += velocity;
+        let move_vec = vec2(self.angle.cos(), self.angle.sin()) * self.current_speed;
+        self.pos += move_vec + self.impulse_vec;
+        self.impulse_vec *= 0.82; 
 
+        // Metabolismo
         self.energy -= ENERGY_LOSS_IDLE;
-        self.energy -= (self.current_speed / 1.3) * ENERGY_LOSS_RUN;
+        if self.current_speed > 0.1 {
+            let move_cost = if self.current_speed > 1.4 || self.impulse_vec.length() > 1.0 { ENERGY_LOSS_RUN } else { ENERGY_LOSS_MOVE };
+            self.energy -= (self.current_speed / 1.5) * move_cost;
+        }
+        self.energy -= steer.abs() * ENERGY_LOSS_ROTATION;
         
-        if is_near_wall && self.current_speed > 0.4 {
-            self.energy -= 0.03;
-        }
+        if is_near_wall && self.current_speed > 0.4 { self.energy -= 0.05; }
 
-        // Ativação do ataque - impede ataque em cooldown ou durante proteção familiar inicial
-        self.is_attacking = attack_input > 0.4 && self.attack_cooldown <= 0.0; 
-        if self.is_attacking {
-            self.energy -= ATTACK_COST;
-        }
+        // Estado visual do ataque: dura metade do cooldown para ser claro
+        self.is_attacking = self.attack_cooldown > (ATTACK_COOLDOWN_TIME - 0.6) && self.spawn_timer <= 0.0; 
 
-        // Limites físicos
         self.pos.x = self.pos.x.clamp(8.0, world_w - 8.0);
         self.pos.y = self.pos.y.clamp(8.0, world_h - 8.0);
     }
@@ -206,12 +226,13 @@ impl Agent {
     fn draw_body(&self) {
         let mut draw_color = if self.is_attacking { RED } else { self.color };
         
-        // Efeito visual de proteção familiar (brilho suave)
-        if self.family_timer > 0.0 {
-            draw_color.a = 0.6 + (self.family_timer * 3.0).sin() * 0.2;
-            draw_circle_lines(self.pos.x, self.pos.y, 10.0, 1.0, SKYBLUE);
+        if self.spawn_timer > 0.0 || self.family_timer > 0.0 {
+            let timer = if self.spawn_timer > 0.0 { self.spawn_timer } else { self.family_timer };
+            draw_color.a = 0.5 + (timer * 4.0).sin() * 0.2;
+            draw_circle_lines(self.pos.x, self.pos.y, 11.0, 1.0, SKYBLUE);
         }
 
+        if self.hit_timer > 0.0 { draw_color.a = 0.3; }
         draw_poly(self.pos.x, self.pos.y, 3, 8.0, self.angle.to_degrees(), draw_color);
         
         draw_rectangle(self.pos.x - 8.0, self.pos.y - 14.0, 16.0, 3.0, Color::new(0.2, 0.2, 0.2, 0.6));
@@ -222,45 +243,27 @@ impl Agent {
     fn draw_label(&self, camera: &Camera2D) {
         let screen_pos = camera.world_to_screen(self.pos);
         let gen_text = format!("G{}", self.generation);
-        let font_size = 14.0;
-        let text_dims = measure_text(&gen_text, None, font_size as u16, 1.0);
-        
-        draw_text(
-            &gen_text, 
-            screen_pos.x - text_dims.width / 2.0, 
-            screen_pos.y + 25.0, 
-            font_size, 
-            WHITE
-        );
+        let text_dims = measure_text(&gen_text, None, 14, 1.0);
+        draw_text(&gen_text, screen_pos.x - text_dims.width / 2.0, screen_pos.y + 30.0, 14.0, WHITE);
     }
 }
 
 // --- MAIN ---
 
-#[macroquad::main("Ecossistema: Sobrevivência Familiar")]
+#[macroquad::main("Ecossistema: Fim do Giro Infinito")]
 async fn main() {
     let mut world_w = screen_width();
     let mut world_h = screen_height();
-    let mut id_counter: u64 = 0;
+    let mut id_generator: u64 = 0;
 
     let mut agents: Vec<Agent> = (0..INITIAL_AGENTS)
         .map(|_| {
-            id_counter += 1;
-            Agent::new(
-                id_counter,
-                None,
-                vec2(gen_range(100.0, world_w-100.0), gen_range(100.0, world_h-100.0)),
-                Brain::new_random(),
-                Color::new(gen_range(0.3, 0.6), gen_range(0.4, 0.8), 1.0, 1.0),
-                1
-            )
+            id_generator += 1;
+            Agent::new(id_generator, None, vec2(gen_range(100.0, world_w-100.0), gen_range(100.0, world_h-100.0)), Brain::new_random(), Color::new(gen_range(0.3, 0.6), gen_range(0.4, 0.8), 1.0, 1.0), 1)
         })
         .collect();
 
-    let mut foods: Vec<Vec2> = (0..INITIAL_FOOD_COUNT)
-        .map(|_| vec2(gen_range(50.0, world_w-50.0), gen_range(50.0, world_h-50.0)))
-        .collect();
-
+    let mut foods: Vec<Vec2> = (0..INITIAL_FOOD_COUNT).map(|_| vec2(gen_range(50.0, world_w-50.0), gen_range(50.0, world_h-50.0))).collect();
     let mut max_food = INITIAL_FOOD_COUNT;
     let mut zoom: f32 = 1.0;
     let mut camera_pos = vec2(world_w / 2.0, world_h / 2.0);
@@ -272,19 +275,13 @@ async fn main() {
 
         let (_, wheel_y) = mouse_wheel();
         if wheel_y != 0.0 {
-            let mut camera = Camera2D {
-                target: camera_pos,
-                zoom: vec2(zoom / world_w * 2.0, -zoom / world_h * 2.0),
-                ..Default::default()
-            };
+            let mut camera = Camera2D { target: camera_pos, zoom: vec2(zoom / world_w * 2.0, -zoom / world_h * 2.0), ..Default::default() };
             let mouse_world_before = camera.screen_to_world(mouse_position().into());
             let zoom_speed: f32 = 1.1; 
             if wheel_y > 0.0 { zoom *= zoom_speed; } else { zoom /= zoom_speed; }
             zoom = zoom.clamp(1.0, 10.0);
-
-            if zoom <= 1.001 {
-                camera_pos = vec2(world_w / 2.0, world_h / 2.0);
-            } else {
+            if zoom <= 1.001 { camera_pos = vec2(world_w / 2.0, world_h / 2.0); } 
+            else {
                 camera.zoom = vec2(zoom / world_w * 2.0, -zoom / world_h * 2.0);
                 let mouse_world_after = camera.screen_to_world(mouse_position().into());
                 camera_pos += mouse_world_before - mouse_world_after;
@@ -297,126 +294,81 @@ async fn main() {
             if m_pos.0 > world_w - 100.0 && m_pos.0 < world_w - 60.0 && m_pos.1 > 10.0 && m_pos.1 < 50.0 { if max_food > 0 { max_food -= 1; } }
         }
 
-        if foods.len() < max_food && gen_range(0, 30) == 0 {
-            foods.push(vec2(gen_range(30.0, world_w-30.0), gen_range(30.0, world_h-30.0)));
-        }
+        if foods.len() < max_food && gen_range(0, 30) == 0 { foods.push(vec2(gen_range(30.0, world_w-30.0), gen_range(30.0, world_h-30.0))); }
 
         let mut new_agents = Vec::new();
 
-        // --- LÓGICA DE INTERAÇÃO (ALIMENTAÇÃO E COMBATE) ---
+        // --- LÓGICA DE INTERAÇÃO (DANO GARANTIDO) ---
         for i in 0..agents.len() {
-            // Alimentação
             foods.retain(|&f| {
-                if agents[i].pos.distance(f) < 16.0 {
-                    agents[i].energy += 85.0; 
+                if agents[i].pos.distance(f) < 20.0 {
+                    agents[i].energy += 95.0; 
                     false
                 } else { true }
             });
 
-            // Combate com Proteção Familiar
-            if agents[i].is_attacking && agents[i].attack_cooldown <= 0.0 {
-                let mut hit_detected = false;
+            if agents[i].is_attacking {
                 for j in 0..agents.len() {
                     if i == j { continue; }
+                    if agents[j].spawn_timer > 0.0 || agents[j].hit_timer > 0.0 { continue; }
                     
-                    // MECÂNICA GENIAL: Checagem de parentesco e tempo de proteção
-                    let is_parent_child = agents[i].parent_id == Some(agents[j].id) || agents[j].parent_id == Some(agents[i].id);
-                    let family_protected = is_parent_child && (agents[i].family_timer > 0.0 || agents[j].family_timer > 0.0);
-
-                    if family_protected { continue; }
+                    let are_family = agents[i].parent_id == Some(agents[j].id) || agents[j].parent_id == Some(agents[i].id);
+                    if are_family && (agents[i].family_timer > 0.0 || agents[j].family_timer > 0.0) { continue; }
 
                     let dist = agents[i].pos.distance(agents[j].pos);
-                    if dist < 22.0 {
-                        // Dano e Recompensa
-                        agents[j].energy -= 18.0;
-                        agents[i].energy += 12.0; 
-                        
-                        // Recuo Suavizado (Knockback)
-                        let push_dir = (agents[j].pos - agents[i].pos).normalize();
-                        agents[j].pos += push_dir * KNOCKBACK_FORCE;
-                        
-                        hit_detected = true;
+                    // Raio de acerto generoso durante o bote para garantir que a agressividade funcione
+                    if dist < 28.0 {
+                        agents[j].energy -= 40.0; 
+                        agents[i].energy += 25.0; 
+                        agents[j].hit_timer = HIT_STUN_TIME; 
+                        let push_dir = (agents[j].pos - agents[i].pos).normalize_or_zero();
+                        agents[j].impulse_vec += push_dir * KNOCKBACK_IMPULSE;
+                        agents[i].impulse_vec -= push_dir * (KNOCKBACK_IMPULSE * 0.3); 
                     }
-                }
-                
-                if hit_detected {
-                    agents[i].attack_cooldown = ATTACK_COOLDOWN_TIME;
                 }
             }
         }
 
         for i in 0..agents.len() {
-            let closest_f = foods.iter()
-                .filter(|&&f| agents[i].pos.distance(f) < VISION_RADIUS)
-                .min_by(|a, b| agents[i].pos.distance(**a).partial_cmp(&agents[i].pos.distance(**b)).unwrap())
-                .cloned();
-
+            let closest_f = foods.iter().filter(|&&f| agents[i].pos.distance(f) < VISION_RADIUS).min_by(|a, b| agents[i].pos.distance(**a).partial_cmp(&agents[i].pos.distance(**b)).unwrap()).cloned();
             let mut closest_e = None;
             let mut min_dist_e = VISION_RADIUS;
             for j in 0..agents.len() {
                 if i == j { continue; }
+                let are_family = agents[i].parent_id == Some(agents[j].id) || agents[j].parent_id == Some(agents[i].id);
+                if are_family && (agents[i].family_timer > 0.0 || agents[j].family_timer > 0.0) { continue; }
                 let d = agents[i].pos.distance(agents[j].pos);
-                if d < min_dist_e {
-                    min_dist_e = d;
-                    closest_e = Some(agents[j].pos);
-                }
+                if d < min_dist_e { min_dist_e = d; closest_e = Some(agents[j].pos); }
             }
 
             let agent = &mut agents[i];
             agent.update(closest_f, closest_e, world_w, world_h, dt);
 
-            if agent.energy > 290.0 {
-                agent.energy -= 145.0;
-                id_counter += 1;
-                new_agents.push(Agent::new(
-                    id_counter, 
-                    Some(agent.id), 
-                    agent.pos, 
-                    agent.brain.mutate(), 
-                    agent.color, 
-                    agent.generation + 1
-                ));
+            if agent.energy > 300.0 {
+                agent.energy -= 150.0; id_generator += 1;
+                new_agents.push(Agent::new(id_generator, Some(agent.id), agent.pos, agent.brain.mutate(), agent.color, agent.generation + 1));
             }
         }
         agents.retain(|a| a.energy > 0.0);
         agents.extend(new_agents);
 
         clear_background(Color::new(0.01, 0.01, 0.02, 1.0));
-
-        let camera = Camera2D {
-            target: camera_pos,
-            zoom: vec2(zoom / world_w * 2.0, -zoom / world_h * 2.0),
-            ..Default::default()
-        };
-        
+        let camera = Camera2D { target: camera_pos, zoom: vec2(zoom / world_w * 2.0, -zoom / world_h * 2.0), ..Default::default() };
         set_camera(&camera);
         draw_rectangle_lines(0.0, 0.0, world_w, world_h, 3.0, Color::new(0.3, 0.3, 0.7, 0.3));
 
-        for food in &foods {
-            draw_circle(food.x, food.y, 4.0, GREEN);
-            draw_circle_lines(food.x, food.y, 6.0, 1.0, Color::new(0.0, 1.0, 0.0, 0.2));
-        }
-        for agent in &agents {
-            agent.draw_body();
-        }
+        for food in &foods { draw_circle(food.x, food.y, 4.0, GREEN); draw_circle_lines(food.x, food.y, 6.0, 1.0, Color::new(0.0, 1.0, 0.0, 0.2)); }
+        for agent in &agents { agent.draw_body(); }
 
         set_default_camera();
-        for agent in &agents {
-            agent.draw_label(&camera);
-        }
+        for agent in &agents { agent.draw_label(&camera); }
 
         draw_rectangle(10.0, 10.0, 300.0, 50.0, Color::new(0.0, 0.0, 0.0, 0.8));
         draw_text(&format!("POPULAÇÃO: {} | RECURSOS: {}/{}", agents.len(), foods.len(), max_food), 20.0, 40.0, 20.0, WHITE);
-        
-        draw_rectangle(world_w - 110.0, 10.0, 45.0, 45.0, Color::new(0.3, 0.1, 0.1, 1.0));
-        draw_text("-", world_w - 92.0, 42.0, 30.0, WHITE);
-        draw_rectangle(world_w - 55.0, 10.0, 45.0, 45.0, Color::new(0.1, 0.3, 0.1, 1.0));
-        draw_text("+", world_w - 40.0, 42.0, 30.0, WHITE);
+        draw_rectangle(world_w - 110.0, 10.0, 45.0, 45.0, Color::new(0.3, 0.1, 0.1, 1.0)); draw_text("-", world_w - 92.0, 42.0, 30.0, WHITE);
+        draw_rectangle(world_w - 55.0, 10.0, 45.0, 45.0, Color::new(0.1, 0.3, 0.1, 1.0)); draw_text("+", world_w - 40.0, 42.0, 30.0, WHITE);
 
-        if agents.is_empty() {
-            draw_text("EXTINÇÃO", world_w / 2.0 - 80.0, world_h / 2.0, 40.0, RED);
-        }
-
+        if agents.is_empty() { draw_text("EXTINÇÃO", world_w / 2.0 - 80.0, world_h / 2.0, 40.0, RED); }
         next_frame().await
     }
 }
