@@ -1,14 +1,15 @@
 use macroquad::{prelude::*, rand::gen_range};
 
-// --- CONFIGURAÇÕES ---
-const INITIAL_AGENTS: usize = 8;
-const INITIAL_FOOD_COUNT: usize = 6;
+// --- CONFIGURAÇÕES DO ECOSSISTEMA ---
+const INITIAL_AGENTS: usize = 10;
+const INITIAL_FOOD_COUNT: usize = 8;
+const VISION_RADIUS: f32 = 150.0; 
 
-// Custos balanceados
-const ENERGY_LOSS_IDLE: f32 = 0.003;
-const ENERGY_LOSS_MOVE: f32 = 0.08;
-const ENERGY_LOSS_RUN: f32 = 0.2;
-const ATTACK_COST: f32 = 0.3;
+// Custos de energia ajustados para a nova velocidade
+const ENERGY_LOSS_IDLE: f32 = 0.005;
+const ENERGY_LOSS_MOVE: f32 = 0.02;
+const ENERGY_LOSS_RUN: f32 = 0.1; // Reduzido ligeiramente
+const ATTACK_COST: f32 = 0.4;
 
 // --- ESTRUTURAS DE IA ---
 
@@ -20,12 +21,14 @@ struct Brain {
 impl Brain {
     fn new_random() -> Self {
         let mut weights = vec![0.0; 18];
-        weights[1] = 0.8;  // Instinto de virar para a comida
-        weights[11] = 0.4; // Impulso de movimento
-        weights[17] = -1.2; // Tendência a não atacar
+        
+        weights[1] = 1.5;  
+        weights[11] = 0.5; 
+        weights[17] = -1.5; 
+        weights[14] = 0.8; 
 
         for w in weights.iter_mut() {
-            *w += gen_range(-0.2, 0.2);
+            *w += gen_range(-0.3, 0.3);
         }
         Self { weights }
     }
@@ -33,8 +36,8 @@ impl Brain {
     fn mutate(&self) -> Self {
         let mut new_weights = self.weights.clone();
         for w in new_weights.iter_mut() {
-            if gen_range(0.0, 1.0) < 0.2 {
-                *w += gen_range(-0.15, 0.15);
+            if gen_range(0.0, 1.0) < 0.15 {
+                *w += gen_range(-0.1, 0.1);
             }
         }
         Self { weights: new_weights }
@@ -71,6 +74,7 @@ struct Agent {
     is_attacking: bool,
     current_speed: f32,
     generation: u32,
+    wander_t: f32, 
 }
 
 impl Agent {
@@ -84,64 +88,59 @@ impl Agent {
             is_attacking: false,
             current_speed: 0.0,
             generation,
+            wander_t: gen_range(0.0, 100.0),
         }
     }
 
     fn update(&mut self, closest_food: Option<Vec2>, closest_enemy: Option<Vec2>, world_w: f32, world_h: f32) {
-        let food_input_dist;
-        let food_input_angle;
+        let mut inputs = [0.0; 6];
+        inputs[4] = (self.energy / 200.0).clamp(0.0, 1.0);
+        inputs[5] = 1.0; 
+
         if let Some(f) = closest_food {
-            let rel = f - self.pos;
-            food_input_dist = (1.0 - (rel.length() / world_w)).clamp(0.0, 1.0);
-            let target_angle = rel.y.atan2(rel.x);
-            food_input_angle = wrap_angle(target_angle - self.angle) / std::f32::consts::PI;
-        } else {
-            food_input_dist = 0.0;
-            food_input_angle = 0.0;
+            let dist = self.pos.distance(f);
+            if dist < VISION_RADIUS {
+                inputs[0] = 1.0 - (dist / VISION_RADIUS); 
+                let rel = f - self.pos;
+                let target_angle = rel.y.atan2(rel.x);
+                inputs[1] = wrap_angle(target_angle - self.angle) / std::f32::consts::PI;
+            }
         }
 
-        let enemy_input_dist;
-        let enemy_input_angle;
         if let Some(e) = closest_enemy {
-            let rel = e - self.pos;
-            enemy_input_dist = (1.0 - (rel.length() / world_w)).clamp(0.0, 1.0);
-            let target_angle = rel.y.atan2(rel.x);
-            enemy_input_angle = wrap_angle(target_angle - self.angle) / std::f32::consts::PI;
-        } else {
-            enemy_input_dist = 0.0;
-            enemy_input_angle = 0.0;
+            let dist = self.pos.distance(e);
+            if dist < VISION_RADIUS {
+                inputs[2] = 1.0 - (dist / VISION_RADIUS);
+                let rel = e - self.pos;
+                let target_angle = rel.y.atan2(rel.x);
+                inputs[3] = wrap_angle(target_angle - self.angle) / std::f32::consts::PI;
+            }
         }
-
-        let inputs = [
-            food_input_dist,
-            food_input_angle,
-            enemy_input_dist,
-            enemy_input_angle,
-            (self.energy / 200.0).clamp(0.0, 1.0),
-            1.0 
-        ];
 
         let (steer, speed_input, attack_input) = self.brain.think(&inputs);
 
-        self.angle += gen_range(-0.04, 0.04); 
-        self.angle += steer * 0.08; 
+        // --- COMPORTAMENTO MAIS LENTO ---
         
-        let target_speed = if speed_input > -0.4 {
-            ((speed_input + 0.4) / 1.4) * 1.4
+        if inputs[0] == 0.0 && inputs[2] == 0.0 {
+            self.wander_t += 0.05;
+            self.angle += (self.wander_t.sin() * 0.03) + gen_range(-0.01, 0.01);
+            // Velocidade de cruzeiro reduzida para 0.4
+            self.current_speed = self.current_speed * 0.95 + 0.4 * 0.05; 
         } else {
-            0.0
-        };
+            self.angle += steer * 0.1;
+            // Velocidade máxima reduzida de 2.5 para 1.2
+            let target_speed = if speed_input > -0.2 { ((speed_input + 0.2) / 1.2) * 1.2 } else { 0.0 };
+            self.current_speed = self.current_speed * 0.8 + target_speed * 0.2;
+        }
 
-        self.current_speed = self.current_speed * 0.9 + target_speed * 0.1;
         let velocity = vec2(self.angle.cos(), self.angle.sin()) * self.current_speed;
         self.pos += velocity;
 
         self.energy -= ENERGY_LOSS_IDLE;
-        if self.current_speed > 0.1 {
-            self.energy -= if self.current_speed > 1.0 { ENERGY_LOSS_RUN } else { ENERGY_LOSS_MOVE };
-        }
+        // Gasto proporcional à nova escala de velocidade
+        self.energy -= (self.current_speed / 1.2) * ENERGY_LOSS_RUN;
         
-        self.is_attacking = attack_input > 0.6;
+        self.is_attacking = attack_input > 0.3; 
         if self.is_attacking {
             self.energy -= ATTACK_COST;
         }
@@ -152,28 +151,23 @@ impl Agent {
 
     fn draw_body(&self) {
         let draw_color = if self.is_attacking { RED } else { self.color };
+        draw_poly(self.pos.x, self.pos.y, 3, 8.0, self.angle.to_degrees(), draw_color);
         
-        // Desenha o triângulo (corpo)
-        draw_poly(self.pos.x, self.pos.y, 3, 7.0, self.angle.to_degrees(), draw_color);
-        
-        // Barra de energia (seguindo o agente no mundo)
-        draw_rectangle(self.pos.x - 6.0, self.pos.y - 12.0, 12.0, 2.0, Color::new(0.2, 0.2, 0.2, 0.5));
-        let energy_ratio = (self.energy / 100.0).clamp(0.0, 1.0);
-        draw_rectangle(self.pos.x - 6.0, self.pos.y - 12.0, 12.0 * energy_ratio, 2.0, GREEN);
+        draw_rectangle(self.pos.x - 8.0, self.pos.y - 14.0, 16.0, 3.0, Color::new(0.2, 0.2, 0.2, 0.6));
+        let energy_ratio = (self.energy / 120.0).clamp(0.0, 1.0);
+        draw_rectangle(self.pos.x - 8.0, self.pos.y - 14.0, 16.0 * energy_ratio, 3.0, if energy_ratio > 0.3 { GREEN } else { ORANGE });
     }
 
-    // Função separada para desenhar o texto no espaço do ecrã (evita espelhamento)
     fn draw_label(&self, camera: &Camera2D) {
         let screen_pos = camera.world_to_screen(self.pos);
         let gen_text = format!("G{}", self.generation);
         let font_size = 14.0;
         let text_dims = measure_text(&gen_text, None, font_size as u16, 1.0);
         
-        // Desenha no ecrã real, onde o texto não sofre inversão da câmara
         draw_text(
             &gen_text, 
             screen_pos.x - text_dims.width / 2.0, 
-            screen_pos.y + 25.0 * (camera.zoom.y.abs() * screen_height() / 2.0).clamp(0.5, 1.5), 
+            screen_pos.y + 25.0, 
             font_size, 
             WHITE
         );
@@ -182,7 +176,7 @@ impl Agent {
 
 // --- MAIN ---
 
-#[macroquad::main("Ecossistema: Fix de Texto Espelhado")]
+#[macroquad::main("Ecossistema: Evolução e Sobrevivência")]
 async fn main() {
     let mut world_w = screen_width();
     let mut world_h = screen_height();
@@ -208,7 +202,6 @@ async fn main() {
         world_w = screen_width();
         world_h = screen_height();
 
-        // --- ZOOM FOCADO NO RATO ---
         let (_, wheel_y) = mouse_wheel();
         if wheel_y != 0.0 {
             let mut camera = Camera2D {
@@ -216,12 +209,9 @@ async fn main() {
                 zoom: vec2(zoom / world_w * 2.0, -zoom / world_h * 2.0),
                 ..Default::default()
             };
-
             let mouse_world_before = camera.screen_to_world(mouse_position().into());
-
             let zoom_speed: f32 = 1.1; 
             if wheel_y > 0.0 { zoom *= zoom_speed; } else { zoom /= zoom_speed; }
-            
             zoom = zoom.clamp(1.0, 10.0);
 
             if zoom <= 1.001 {
@@ -233,28 +223,22 @@ async fn main() {
             }
         }
 
-        // --- UI E BOTÕES ---
         if is_mouse_button_pressed(MouseButton::Left) {
             let m_pos = mouse_position();
-            if m_pos.0 > world_w - 50.0 && m_pos.0 < world_w - 10.0 && m_pos.1 > 10.0 && m_pos.1 < 50.0 {
-                max_food += 1;
-            }
-            if m_pos.0 > world_w - 100.0 && m_pos.0 < world_w - 60.0 && m_pos.1 > 10.0 && m_pos.1 < 50.0 {
-                if max_food > 0 { max_food -= 1; }
-            }
+            if m_pos.0 > world_w - 50.0 && m_pos.0 < world_w - 10.0 && m_pos.1 > 10.0 && m_pos.1 < 50.0 { max_food += 1; }
+            if m_pos.0 > world_w - 100.0 && m_pos.0 < world_w - 60.0 && m_pos.1 > 10.0 && m_pos.1 < 50.0 { if max_food > 0 { max_food -= 1; } }
         }
 
-        // --- LÓGICA DO MUNDO ---
-        if foods.len() < max_food && gen_range(0, 20) == 0 {
+        if foods.len() < max_food && gen_range(0, 30) == 0 {
             foods.push(vec2(gen_range(30.0, world_w-30.0), gen_range(30.0, world_h-30.0)));
         }
-        if foods.len() > max_food { foods.pop(); }
 
         let mut new_agents = Vec::new();
+
         for i in 0..agents.len() {
             foods.retain(|&f| {
-                if agents[i].pos.distance(f) < 18.0 {
-                    agents[i].energy += 75.0; 
+                if agents[i].pos.distance(f) < 15.0 {
+                    agents[i].energy += 80.0; 
                     false
                 } else { true }
             });
@@ -263,9 +247,9 @@ async fn main() {
                 for j in 0..agents.len() {
                     if i == j { continue; }
                     let dist = agents[i].pos.distance(agents[j].pos);
-                    if dist < 22.0 {
-                        agents[j].energy -= 8.0;
-                        agents[i].energy += 4.0; 
+                    if dist < 20.0 {
+                        agents[j].energy -= 10.0;
+                        agents[i].energy += 5.0; 
                     }
                 }
             }
@@ -273,11 +257,12 @@ async fn main() {
 
         for i in 0..agents.len() {
             let closest_f = foods.iter()
+                .filter(|&&f| agents[i].pos.distance(f) < VISION_RADIUS)
                 .min_by(|a, b| agents[i].pos.distance(**a).partial_cmp(&agents[i].pos.distance(**b)).unwrap())
                 .cloned();
 
             let mut closest_e = None;
-            let mut min_dist_e = f32::MAX;
+            let mut min_dist_e = VISION_RADIUS;
             for j in 0..agents.len() {
                 if i == j { continue; }
                 let d = agents[i].pos.distance(agents[j].pos);
@@ -290,16 +275,15 @@ async fn main() {
             let agent = &mut agents[i];
             agent.update(closest_f, closest_e, world_w, world_h);
 
-            if agent.energy > 280.0 {
-                agent.energy -= 140.0;
+            if agent.energy > 300.0 {
+                agent.energy -= 150.0;
                 new_agents.push(Agent::new(agent.pos, agent.brain.mutate(), agent.color, agent.generation + 1));
             }
         }
         agents.retain(|a| a.energy > 0.0);
         agents.extend(new_agents);
 
-        // --- RENDERIZAÇÃO ---
-        clear_background(Color::new(0.015, 0.015, 0.02, 1.0));
+        clear_background(Color::new(0.01, 0.01, 0.02, 1.0));
 
         let camera = Camera2D {
             target: camera_pos,
@@ -307,33 +291,32 @@ async fn main() {
             ..Default::default()
         };
         
-        // Desenha objetos do mundo (com câmara ativa)
         set_camera(&camera);
+        draw_rectangle_lines(0.0, 0.0, world_w, world_h, 2.0, Color::new(0.2, 0.2, 0.5, 0.2));
+
         for food in &foods {
-            draw_circle(food.x, food.y, 4.5, GREEN);
-            draw_circle_lines(food.x, food.y, 6.0, 1.0, Color::new(0.0, 1.0, 0.0, 0.3));
+            draw_circle(food.x, food.y, 4.0, GREEN);
+            draw_circle_lines(food.x, food.y, 6.0, 1.0, Color::new(0.0, 1.0, 0.0, 0.2));
         }
         for agent in &agents {
             agent.draw_body();
         }
 
-        // Desenha UI e Rótulos (com câmara padrão/ecrã)
         set_default_camera();
         for agent in &agents {
             agent.draw_label(&camera);
         }
 
-        draw_rectangle(5.0, 5.0, 280.0, 40.0, Color::new(0.0, 0.0, 0.0, 0.8));
-        draw_text(&format!("Vivos: {} | Recursos: {}/{}", agents.len(), foods.len(), max_food), 15.0, 30.0, 20.0, WHITE);
+        draw_rectangle(10.0, 10.0, 300.0, 50.0, Color::new(0.0, 0.0, 0.0, 0.8));
+        draw_text(&format!("POPULAÇÃO: {} | RECURSOS: {}/{}", agents.len(), foods.len(), max_food), 20.0, 40.0, 20.0, WHITE);
         
-        draw_rectangle(world_w - 100.0, 10.0, 40.0, 40.0, Color::new(0.2, 0.0, 0.0, 1.0));
-        draw_text("-", world_w - 85.0, 40.0, 30.0, WHITE);
-        
-        draw_rectangle(world_w - 50.0, 10.0, 40.0, 40.0, Color::new(0.0, 0.2, 0.0, 1.0));
-        draw_text("+", world_w - 35.0, 40.0, 30.0, WHITE);
+        draw_rectangle(world_w - 110.0, 10.0, 45.0, 45.0, Color::new(0.3, 0.1, 0.1, 1.0));
+        draw_text("-", world_w - 92.0, 42.0, 30.0, WHITE);
+        draw_rectangle(world_w - 55.0, 10.0, 45.0, 45.0, Color::new(0.1, 0.3, 0.1, 1.0));
+        draw_text("+", world_w - 40.0, 42.0, 30.0, WHITE);
 
         if agents.is_empty() {
-            draw_text("EXTINÇÃO ATINGIDA", world_w / 2.0 - 120.0, world_h / 2.0, 30.0, RED);
+            draw_text("EXTINÇÃO", world_w / 2.0 - 80.0, world_h / 2.0, 40.0, RED);
         }
 
         next_frame().await
