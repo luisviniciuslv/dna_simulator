@@ -1,0 +1,10 @@
+[package]
+name = "dna_simulator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Engine de jogo leve e fácil de usar
+macroquad = "0.4.5"
+# Necessário para gerar posições e cores aleatórias
+rand = "0.8.5"
