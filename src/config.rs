@@ -1,8 +1,8 @@
 use macroquad::prelude::*;
 
 // --- CONFIGURAÇÕES DO MUNDO ---
-pub const INITIAL_AGENTS: usize = 12;
-pub const INITIAL_FOOD_COUNT: usize = 10;
+pub const INITIAL_AGENTS: usize = 4;
+pub const INITIAL_FOOD_COUNT: usize = 2;
 pub const MAX_FOOD_SPAWN_CHANCE: i32 = 40; 
 pub const VISION_RADIUS: f32 = 280.0;
 pub const WALL_SENSE_DIST: f32 = 80.0; 
